@@ -1,0 +1,285 @@
+---
+title: "imputeTestbench GSOC Update: Multivariate Imputation, Performance & Metrics"
+author: "Project notes & demo"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: readable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", fig.width = 7, fig.height = 4.2)
+```
+
+# Overview
+
+This vignette documents the GSOC updates implemented for the *imputeTestbench* evolution, focusing on:
+
+- **Multivariate support** via `impute_errors_multi()` with shared missingness masks across variables.
+- **Improved core**: removal of `eval(parse())`, pre-resolved function objects, and **parallelization hooks** (`future`/`foreach`).
+- **Input class support**: accepts `ts`, `zoo/xts`, and routes multivariate `ts`/`data.frame`/`matrix` (and `tsibble`) automatically.
+- **Method plugin system**: registry to **register/list/get** imputation methods with capabilities (univariate vs multivariate).
+- **Built‑in methods** (R + optional Python via `reticulate`) and graceful skipping of unavailable methods.
+- **Advanced metrics**: structure‑preserving comparisons (`corr_preservation`, `cov_frobenius`, `struct_preservation_index`) and an optional `downstream_forecast_rmse`.
+- **Plotting**: updated `plot_errors()` that reads detail from `attr(errprof, "errall")`, with optional faceting by variable.
+
+# Quick start
+
+> **If you are running this vignette outside the package** (e.g., in a folder of `.R` files), ensure these files are present in the working directory and source them below.
+
+```{r load-files}
+library(ggplot2)
+# Source local dev files if functions are not already available
+need <- function(f) !exists(f, mode = "function")
+
+if (need("sample_dat"))            source("sample_dat.R")
+if (need("impute_errors"))         source("impute_errors.R")
+if (need("impute_errors_multi"))   source("impute_errors_multi.R")
+if (need("plot_errors"))           source("plot_errors.R")
+if (need("register_impute_method")) source("methods_registry.R")
+if (need("register_builtin_methods")) source("methods_builtin.R")
+if (!exists("corr_preservation"))  source("error_functions.R")  # advanced metrics
+if (!exists("globalVariables", mode = "function")) {
+  # harmless in rendering; only needed for R CMD check in a package
+  if (file.exists("globalVariables.R")) source("globalVariables.R")
+}
+
+# Register built-ins (idempotent)
+if (exists("register_builtin_methods")) register_builtin_methods()
+```
+
+### Optional dependencies
+
+Some built‑in methods require additional packages. Install as needed:
+
+```r
+install.packages(c("zoo","imputeTS","VIM","missForest","mice","future.apply","future","foreach","doParallel","forecast"))
+# For Python KNN: reticulate + scikit-learn (one-time)
+# install.packages("reticulate")
+# reticulate::conda_create("r-sklearn", packages = c("python=3.10"))
+# reticulate::conda_install("r-sklearn", packages = c("scikit-learn","numpy"), pip = TRUE)
+# reticulate::use_condaenv("r-sklearn", required = TRUE)
+```
+
+# API highlights
+
+## `impute_errors()` — univariate benchmark
+
+- Accepts numeric vectors and **`ts`** objects; auto‑routes multivariate inputs to `impute_errors_multi()`.
+- Key args: `methods`, `error`, `missPercent`, `repetition`, `simtype` = `"mcar"`/`"mar"`, `parallel`, `workers`.
+- Returns a data.frame with class `errprof`. Attributes:
+  - `attr(x, "errall")`: detailed rows (`Method`, `Percent`, `Repetition`, `Error` [, `Variable`]).
+  - `attr(x, "metric")`, `attr(x, "simtype")`, `attr(x, "repetition")`.
+
+## `impute_errors_multi()` — multivariate benchmark
+
+- Accepts `matrix`, `data.frame` (numeric columns), multivariate `ts`, and `tsibble`.
+- Uses **shared masks** across variables per repetition/percent.
+- Supports **multivariate‐capable methods** (called **once** per repetition) and univariate methods (applied **per column**).
+- Structural metrics are computed on the **entire imputed matrix** per repetition and stored with `Variable = "STRUCT"`.
+
+## Method registry
+
+- `register_impute_method(name, fun, mode = "univariate"|"multivariate", pkg = NULL, notes = NULL)`
+- `list_impute_methods()`
+- `get_impute_method(name)`
+- Built‑ins are registered by `register_builtin_methods()`.
+
+## Plotting
+
+- `plot_errors(errprof, plotType = "boxplot" | "bar" | "line", facet_by_variable = FALSE)`
+- Reads `attr(errprof, "errall")` and adapts automatically.
+- Prints a note if some methods were **skipped** (missing deps).
+
+# Examples
+
+## 1. Univariate benchmark (toy series)
+
+```{r ex1-univariate}
+# simple imputation methods
+mean_impute <- function(x, ...) { x[is.na(x)] <- mean(x, na.rm = TRUE); x }
+locf_impute <- function(x, ...) {
+  if (!requireNamespace("zoo", quietly = TRUE)) stop("Please install 'zoo' for locf_impute")
+  zoo::na.locf(x, na.rm = FALSE)
+}
+# metric
+rmse <- function(truth, estimate) sqrt(mean((truth - estimate)^2, na.rm = TRUE))
+
+set.seed(123)
+ts_u <- sin(seq(0, 8*pi, length.out = 500)) + stats::rnorm(500, sd = 0.1)
+
+res_u <- impute_errors(
+  dataIn      = ts_u,
+  methods     = c("mean_impute", "locf_impute"),
+  error       = "rmse",
+  missPercent = c(10, 30),
+  repetition  = 3,
+  simtype     = "mar",
+  blck        = 10
+)
+res_u
+head(attr(res_u, "errall"))
+```
+
+### Plot (averages)
+
+```{r ex1-plot-line, fig.height=3.8}
+plot_errors(res_u, plotType = "line")
+```
+
+## 2. Multivariate benchmark (two correlated series)
+
+```{r ex2-multi, message=FALSE}
+ts_v1 <- ts_u
+ts_v2 <- ts_u + stats::rnorm(500, sd = 0.05)
+X <- cbind(A = ts_v1, B = ts_v2)
+
+res_m <- impute_errors_multi(
+  dataIn      = X,
+  methods     = c("mean_impute", "locf_impute"),
+  error       = "rmse",
+  missPercent = c(10, 30),
+  repetition  = 3,
+  simtype     = "mcar"
+)
+res_m
+head(attr(res_m, "by_variable"))
+```
+
+### Faceted boxplot
+
+```{r ex2-plot-box, message=FALSE}
+library(ggplot2)
+errall_m <- attr(res_m, "errall")
+ggplot(errall_m, aes(x = factor(Percent), y = Error, fill = Method)) +
+  geom_boxplot() +
+  facet_wrap(~ Variable, scales = "free_y") +
+  labs(x = "% Missing", y = "RMSE", title = "Multivariate imputation benchmark")
+```
+
+## 3. Built‑in plotter
+
+```{r ex3-plotter, fig.height=3.8}
+plot_errors(res_u, plotType = "boxplot")
+plot_errors(res_u, plotType = "bar")
+plot_errors(res_u, plotType = "line")
+```
+
+## 4. Parallelization
+
+```{r ex4-parallel, eval=FALSE}
+# install.packages(c("future.apply","future","doParallel","foreach"))
+res_u_par <- impute_errors(
+  dataIn      = ts_u,
+  methods     = c("mean_impute", "locf_impute"),
+  error       = "rmse",
+  missPercent = c(10, 30),
+  repetition  = 8,
+  simtype     = "mcar",
+  parallel    = "future",   # or "foreach"
+  workers     = 4
+)
+print(res_u_par)
+```
+
+## 5. Accepting `ts` inputs (univariate & multivariate)
+
+```{r ex5-ts, message=FALSE}
+# Univariate ts
+res_nottem <- impute_errors(
+  dataIn      = nottem,   # ts object accepted
+  methods     = c("mean_impute"),
+  error       = "rmse",
+  missPercent = c(10, 20),
+  repetition  = 3,
+  simtype     = "mcar"
+)
+res_nottem
+head(attr(res_nottem, "errall"))
+
+# Multivariate ts: auto-routed to impute_errors_multi()
+m   <- cbind(nottem, nottem + stats::rnorm(length(nottem), sd = 1))
+mts <- ts(m, start = start(nottem), frequency = stats::frequency(nottem))
+
+res_multi <- impute_errors(
+  dataIn      = mts,
+  methods     = c("mean_impute", "locf_impute"),
+  error       = "rmse",
+  missPercent = c(10, 20),
+  repetition  = 3,
+  simtype     = "mar",
+  blck        = 6
+)
+res_multi
+head(attr(res_multi, "by_variable"))
+plot_errors(res_multi, plotType = "boxplot", facet_by_variable = TRUE)
+```
+
+## 6. Method registry & mixed uni/multi methods
+
+```{r ex6-registry, message=FALSE}
+list_impute_methods()
+# Expect: mean_impute, locf_impute, interp_linear, interp_spline, kalman_structTS,
+#         missForest_impute_multi, mice_pmm_multi, vim_knn_multi, py_sklearn_knn_multi
+
+set.seed(42)
+n <- 300
+u <- sin(seq(0, 6*pi, length.out = n)) + stats::rnorm(n, sd = 0.1)
+X2 <- cbind(A = u, B = u + stats::rnorm(n, sd = 0.1))
+
+meths <- c("mean_impute", "kalman_structTS", "vim_knn_multi", "mice_pmm_multi")
+rmse  <- function(truth, estimate) sqrt(mean((truth - estimate)^2, na.rm = TRUE))
+
+res_mix <- impute_errors_multi(
+  dataIn      = X2,
+  methods     = meths,     # multivariate ones will run jointly; others per column
+  error       = "rmse",
+  missPercent = c(10, 30),
+  repetition  = 2,
+  simtype     = "mcar"
+)
+res_mix
+head(attr(res_mix, "by_variable"))
+plot_errors(res_mix, plotType = "boxplot", facet_by_variable = TRUE)
+```
+
+## 7. Structural metrics (joint matrix metrics)
+
+```{r ex7-struct, message=FALSE}
+set.seed(123)
+n <- 300
+u <- sin(seq(0, 6*pi, length.out = n)) + stats::rnorm(n, 0, 0.15)
+X3 <- cbind(A = u, B = 0.8*u + stats::rnorm(n, 0, 0.15), C = 0.2*u + stats::rnorm(n, 0, 0.15))
+
+meths2 <- c("mean_impute","kalman_structTS","vim_knn_multi")
+
+# Corr preservation (lower is better); results include a "STRUCT" panel in errall
+res_corr <- impute_errors_multi(
+  dataIn      = X3,
+  methods     = meths2,
+  error       = "corr_preservation",
+  missPercent = c(10, 30),
+  repetition  = 3,
+  simtype     = "mar",
+  blck        = 8
+)
+head(attr(res_corr, "errall"))
+plot_errors(res_corr, plotType = "boxplot", facet_by_variable = TRUE)
+```
+
+# Notes & caveats
+
+- Some Kalman/StructTS fits may emit convergence warnings on noisy data; this does **not** affect the benchmark flow.
+- If optional dependencies are missing, those methods are **auto‑skipped** and reported (e.g., `VIM`, `reticulate` + `sklearn`).
+- Structural metrics return a single scalar per method & repetition (stored under `Variable = "STRUCT"`).
+
+# Session info
+
+```{r session}
+sessionInfo()
+```
