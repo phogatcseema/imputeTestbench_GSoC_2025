@@ -1,4 +1,4 @@
-# Simple registry for imputation methods and their capabilities
+# Simple registry for imputation methods, and their capabilities
 # Each entry: list(fun = function, mode = "univariate"|"multivariate", pkg = NULL, notes = NULL)
 
 # Preserve registry across re-sourcing
@@ -85,3 +85,4 @@ check_method_availability <- function(methods, verbose = TRUE) {
   }
   list(available = unique(avail), skipped = skipped)
 }
+
