@@ -1,5 +1,3 @@
-#' Print method for errprof
-#'
 #' Print method for errprof class
 #'
 #' @param x input errprof object
