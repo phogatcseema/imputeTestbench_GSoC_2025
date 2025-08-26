@@ -1,4 +1,4 @@
-#' impute_errors_multi: multivariate benchmarking (compatible with errprof API)
+#' impute_errors_multi - multivariate benchmarking (compatible with errprof API)
 #'
 #' @param dataIn matrix/data.frame/tsibble (numeric columns) or a vector (falls back to impute_errors)
 #' @inheritParams impute_errors
@@ -202,3 +202,4 @@ impute_errors_multi <- function(dataIn,
   class(agg) <- c("errprof", class(agg))
   return(agg)
 }
+
