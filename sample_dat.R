@@ -1,4 +1,4 @@
-#' sample_dat: simulate missingness with mask return, vector or matrix input
+#' sample_dat: simulate missingness with mask return, vector or matrix inputs
 #'
 #' @param x numeric vector, matrix, or data.frame
 #' @param b integer percent missingness (0-100)
